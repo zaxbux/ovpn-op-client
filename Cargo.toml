@@ -13,6 +13,7 @@ static_assertions = "1.1.0"
 #onepassword-cli = "0.3.4"
 zbus = { version = "3", default-features = false, features = ["tokio"] }
 onepassword-cli = { path = "../onepassword-cli" }
+openvpn3-rs = { path = "/home/zach/vcs/github.com/zaxbux/openvpn3-rs" }
 tokio = { version = "1.23.0", features = ["full"] }
 netns-rs = "0.1.0"
 rtnetlink = "0.11.0"
@@ -23,3 +24,5 @@ clap = { version = "4.0.32", features = ["derive"] }
 serde_json = "1.0.91"
 open = "3.2.0"
 enumflags2 = "0.7.5"
+tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
+tracing-futures = "0.2.5"

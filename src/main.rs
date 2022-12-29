@@ -1,13 +1,16 @@
-mod dbus;
 //pub mod netns;
 
+mod logging;
+
 use clap::Parser;
-use dbus::NetcfgServiceProxy;
 use onepassword_cli::item;
+use openvpn3_rs::OpenVPN3;
 use serde::Deserialize;
 use std::{fs::File, io::BufReader, path::Path, thread::sleep, time::Duration};
 use tokio::signal;
-use zbus::{export::futures_util::StreamExt, Connection};
+use tracing::info;
+
+use zbus::export::ordered_stream::OrderedStreamExt;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -27,6 +30,7 @@ pub enum Error {
     OPError(onepassword_cli::error::Error),
     JSONError(serde_json::Error),
     DBusError(zbus::Error),
+    OpenVPN3(openvpn3_rs::Error),
 }
 
 impl From<std::io::Error> for Error {
@@ -50,6 +54,12 @@ impl From<serde_json::Error> for Error {
 impl From<zbus::Error> for Error {
     fn from(err: zbus::Error) -> Self {
         Self::DBusError(err)
+    }
+}
+
+impl From<openvpn3_rs::Error> for Error {
+    fn from(err: openvpn3_rs::Error) -> Self {
+        Self::OpenVPN3(err)
     }
 }
 
@@ -99,12 +109,18 @@ fn read_from_file<P: AsRef<Path>>(path: P, name: &str) -> Result<Option<Profile>
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    logging::setup().expect("Error setting up logging");
+
     let cli = Cli::parse();
 
     let profile = read_from_file("config.json", &cli.profile)?.ok_or(Error::ProfileNotFound)?;
 
+    info!("Loaded profile");
+
     let op_cli = onepassword_cli::OpCLI::new().await?;
     op_cli.signin().run().await?;
+
+    info!("Signed in to 1Password");
 
     let item = op_cli.item().get(&profile.item).run().await?.unwrap();
 
@@ -122,117 +138,91 @@ async fn main() -> Result<()> {
         .and_then(|field| field.value)
         .ok_or(Error::ConfigFieldMissing)?;
 
+    info!("Found VPN config");
+
     if let Some(ca) = get_item_file_content(&op_cli, &item, "ca.pem").await? {
         ovpn_config += &format!("\n<ca>\n{}</ca>", ca);
+        info!("Found ca certificate");
     }
 
     if let Some(cert) = get_item_file_content(&op_cli, &item, "client.pem").await? {
         ovpn_config += &format!("\n<cert>\n{}</cert>", cert);
+        info!("Found client certificate");
     }
 
     if let Some(key) = get_item_file_content(&op_cli, &item, "client.key").await? {
         ovpn_config += &format!("\n<key>\n{}</key>", key);
+        info!("Found client key");
     }
 
     if let Some(ta) = get_item_file_content(&op_cli, &item, "ta.key").await? {
         ovpn_config += &format!("\n<tls-auth>\n{}</tls-auth>", ta);
+        info!("Found tls-auth key");
     }
 
-    let connection = Connection::system().await?;
+    let openvpn3 = OpenVPN3::connect().await?;
 
-    let netcfg = NetcfgServiceProxy::new(&connection).await?;
+    info!("Connected to OpenVPN3 D-Bus");
+
+    let netcfg = openvpn3.net_cfg_manager().await?;
     let mut netcfg_log_stream = netcfg.receive_log().await?;
+    let mut log_stream = openvpn3.log_stream().await?;
+    let mut event_stream = openvpn3.event_stream().await?;
 
-    let session_manager = dbus::SessionsProxy::new(&connection).await?;
-
-    let mut log_stream = session_manager.receive_log().await?;
-    let mut event_stream = session_manager.receive_session_manager_event().await?;
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 Some(log) = netcfg_log_stream.next() => {
-                    println!("[netcfg][log]{}", log.args().unwrap());
+                    info!("netcfg:log:{:?}", log.args());
                 },
                 Some(log) = log_stream.next() => {
-                    println!("[sessions][log]: {:?}", log.args().unwrap());
+                    info!("sessions:log:{:?}", log.args());
                 },
                 Some(event) = event_stream.next() => {
-                    println!("[sessions][event]: {}", event.args().unwrap());
+                    info!("sessions:event:{:?}", event.args());
                 },
                 else => break
             }
         }
     });
 
-    // This step imports a standard OpenVPN configuration file into the configuration manager.
-    // The configuration file must include all external files embedded into the data being imported.
-    let configuration_manager =
-        dbus::configuration::ConfigurationManagerProxy::new(&connection).await?;
-
-    let config = configuration_manager
+    let config = openvpn3
         .import(&profile.name, &ovpn_config, true, true)
         .await?;
+    let session = config.new_tunnel().await?;
 
-    // This D-Bus method call needs to provide the unique path to a configuration object, provided by the Import call in the previous step.
-    // This call will return a unique object path to this particular VPN session.
-    // If information from the user is required, the session manager will issue a AttentionRequired signal which describes what it requires.
-    // It is the front-end application's responsibility to act upon these signals.
-    let session = session_manager.new_tunnel(&config.path()).await?;
-
-    let mut status_change_stream = session.receive_status_change().await?;
-    let mut attention_required_stream = session.receive_attention_required().await?;
-    let mut log_stream = session.receive_log().await?;
+    let mut status_change_stream = session.status_change_stream().await?;
+    let mut attention_required_stream = session.attention_required_stream().await?;
 
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                Some(log) = log_stream.next() => {
-                    let args = log.args().unwrap();
-                    println!("[session][log]: {:?}", args);
-                },
                 Some(status_change) = status_change_stream.next() => {
-                    println!("[session][status_change]: {:?}", status_change.args());
+                    info!("session:status_change:{:?}", status_change.args());
                 },
                 Some(attention_required) = attention_required_stream.next() => {
                     let args = attention_required.args().unwrap();
-                    println!("[session][attention_required]: {:?}", args);
+                    info!("session:attention_required:{:?}", args);
                 },
                 else => break
             }
         }
     });
 
-    // This method call must be called to ensure the backend VPN process is ready to connect.
-    // It will not return anything if it is ready to connect.
-    // Otherwise it will return an exception with more details.
     let mut ready = false;
     while !ready {
         if let Err(err) = session.ready().await {
-            let err_str = err.to_string();
-            if err_str.find(" Missing user credentials").is_some() {
-                let ui_type_group = session.user_input_queue_get_type_group().await?;
-
-                for (type_, group) in ui_type_group {
-                    let ui_queue_check = session.user_input_queue_check(type_, group).await?;
-
-                    for id in ui_queue_check {
-                        let (type_, group, id, name, _description, _hidden_input) =
-                            session.user_input_queue_fetch(type_, group, id).await?;
-
-                        if name == "username" {
-                            session
-                                .user_input_provide(type_, group, id, &username)
-                                .await?;
-                        }
-
-                        if name == "password" {
-                            session
-                                .user_input_provide(type_, group, id, &password)
-                                .await?;
-                        }
+            if err == openvpn3_rs::Error::MissingUserCredentials {
+                for ui in session.fetch_user_input_slots().await? {
+                    let var_name = ui.variable_name();
+                    if var_name == "username" {
+                        ui.provide_input(&username).await?;
+                    }
+                    if var_name == "password" {
+                        ui.provide_input(&password).await?;
                     }
                 }
-            } else if err_str.find("Backend VPN process is not ready").is_some() {
+            } else if err == openvpn3_rs::Error::BackendNotReady {
                 sleep(Duration::from_secs(1));
             }
         } else {
@@ -240,37 +230,37 @@ async fn main() -> Result<()> {
         }
     }
 
-    session.log_forward(true).await?;
+    let mut log_stream = session.log_stream().await?;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(log) = log_stream.next() => {
+                    //let args = log.args().unwrap();
+                    info!("session:status_change:{:?}", log.args());
+                    //println!("[session][log]: {:?}", args);
+                },
+                else => break
+            }
+        }
+    });
+
+    info!("Connecting...");
 
     session.connect().await?;
 
-    /*let mut status = Status {
-        major: dbus::constants::StatusMajor::UNSET,
-        minor: dbus::constants::StatusMinor::UNSET,
-        status_message: String::from(""),
-    };
-
-    tokio::select! {
-        _ = signal::ctrl_c() => {},
-        _ = async {
-            loop {
-                if let Ok(maybe_status) = session.status().await {
-                    if maybe_status != status {
-                        status = maybe_status;
-                        println!("{:?}", status);
-                    }
-                }
-            }
-        } => {}
-    }; */
+    info!("Connected");
 
     signal::ctrl_c().await?;
+
+    info!("Disconnecting...");
 
     for (label, value) in session.statistics().await? {
         println!("\t{}: {}", label, value);
     }
 
     session.disconnect().await?;
+
+    info!("Disconnected");
 
     Ok(())
 }
